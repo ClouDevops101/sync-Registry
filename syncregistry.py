@@ -1,0 +1,250 @@
+#!/usr/bin/env python
+import subprocess
+import argparse
+import time
+import sys
+import os
+
+def main():
+	args = parse_args()
+
+	just_size = 60
+	current_time = str(time.time()).replace(".","")
+	socket_path = os.path.join(args.folder,"docker_sync_ssh_socket_%s"%current_time)
+	ssh = ["ssh", args.remote, "-o", "ControlPath=%s"%socket_path]
+        print socket_path
+	print("Connecting to %s."%args.remote)
+	master, output = create_master_connection(ssh)
+	if output is not None:
+		print("Ssh connection failed.")
+		sys.exit(1)
+
+	if args.push:
+		source=None
+		dest=ssh
+	else:
+		source=ssh
+		dest=None
+
+	print("Listing source images")
+	source_images = get_source_images(source);
+	check(source_images)
+
+	print("Listing dest images")
+	dest_images = get_dest_images(dest);
+	check(dest_images)
+
+	new, need_update, current = partition_images(source=source_images, dest=dest_images)
+
+	print("\n--> Report:\n")
+	print("current:")
+	print_list(current)
+	print("need update:")
+	print_list(need_update)
+	print("new:")
+	print_list(new)
+
+	#end the program if only asked for the report
+	if args.report or (not args.all and not args.update and not args.new and len(args.images)==0) : return 0
+
+	if len(new)+len(need_update)==0:
+		print("\nEverything is up to date.")
+		sys.exit(0)
+
+	update_set = set(args.images)
+	if args.all:
+		update_set = set(need_update).union(new)
+	else:
+		if args.update:
+			update_set = update_set.union(set(need_update))
+		if args.new:
+			update_set = update_set.union(set(new))
+
+	for name_tag in update_set:
+		if len(args.images)==0 or name_tag in args.images:
+
+			is_new = name_tag in new
+                        print(is_new)
+			file_name = args.folder + "/%s_%s_sync_temp.tar.gz"%(name_tag.replace(":","_").replace("/","_").replace("\\","_"), current_time )
+                        print(file_name)
+			if is_new:
+				print("\n--> Adding '%s':\n"%name_tag)
+
+				print("Getting source image ancestors")
+				source_family = get_image_parents(name_tag, source)
+				check(source_family)
+
+				print("Searching all dest images")
+				all_dest = get_all_images(dest)
+				check(all_dest)
+
+				common_parent = get_common_parent(source_family,all_dest)
+				if common_parent:
+					print("Found common parent: %s"%common_parent[:20])
+                                        print "111-----" + file_name + "------" + common_parent
+					print("Dumping local parent")
+					_, output = execute(["docker", "save" ,"-o", file_name, common_parent])
+                                        print output
+					check(output)
+				else:
+					print("Unable to find a common parent. Importing full image.")
+			else:
+				print("\n--> Updating '%s':\n"%name_tag)
+                                print "-----" + file_name + "------"
+				print("Dumping dest image")
+				_, output = execute(["docker", "save", "-o", file_name, name_tag], ssh=source)
+				check(output)
+
+			print("Dumping source image")
+			_, output = execute(["docker", "save", "-o", file_name, name_tag], ssh=source)
+			check(output)
+
+			print("Starting rsync connection.")
+			if args.push:
+				files = [file_name, "%s:%s"%(args.remote,file_name)]
+			else:
+				files = ["%s:%s"%(args.remote,file_name), file_name]
+			_, output = execute(["rsync", "-e", "ssh -o \"ControlPath=%s\""%socket_path, "-vhz", "--progress"] + files, ssh=None, print_output=True)
+			check(output)
+
+			print("Removing source temporary file")
+			_, output = execute(["rm", file_name], ssh=source)
+			check(output)
+
+			print("Loading new image")
+			_, output = execute(["docker", "load" ,"-i", file_name ] , ssh=dest)
+			check(output)
+
+			print("Removing dest temporary file")
+			_, output = execute(["rm", file_name], ssh=dest)
+			check(output)
+
+	master.stdin.close()
+	master.terminate()
+
+	return
+
+def print_list(list, indent=2):
+	print(' '*indent + '[')
+	for l in list:
+		print(' '*indent*2 + str(l))
+	print(' '*indent + ']')
+
+def create_master_connection(ssh):
+	message ="__ds-connected__"
+	p = subprocess.Popen(ssh + ["-o", "ControlMaster=yes", "echo %s; bash"%message ], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+	line = p.stdout.readline().decode("UTF-8").strip()
+	if line!=message: return p, 1
+	else: return p, p.poll()
+
+def check(output):
+	if output==None or (type(output) is int and output!=0):
+		print("ERROR")
+		print("Please make sure the user you logged in with is able to run docker commands.")
+		sys.exit(1)
+	else:
+		print("DONE")
+
+def partition_images(source, dest):
+	new = []
+	need_update = []
+	current = []
+	for source_name_tag, source_ID in source:
+		found = False
+		for dest_name_tag, dest_ID in dest:
+			if source_name_tag==dest_name_tag:
+				found = True
+				if source_ID!=dest_ID: need_update.append( dest_name_tag )
+				else: current.append( dest_name_tag )
+		if not found:
+			new.append( source_name_tag )
+
+	return new, need_update, current
+
+def get_source_images(ssh):
+	images = get_images(ssh)
+	if images == None: return
+	return [i for i in images if i[0].split(":")[0]!="<none>"]
+
+def get_dest_images(ssh):
+	return get_images(ssh)
+
+def get_images(ssh):
+	output, result = execute(["docker", "images", "--no-trunc"], ssh=ssh)
+	if result!=0: return
+	output = [line.strip().split() for line in output if line.strip()!=""][1:]
+	return [("%s:%s"%(image[0], image[1]), image[2]) for image in output]
+
+def parse_args():
+	parser = argparse.ArgumentParser(description='Synchronize docker images over the network.')
+	parser.add_argument('remote', type=str, help='The remote host to sync the images with.')
+	parser.add_argument('images', type=str, nargs='*', help='The images you want to sync. Use format image:tag.')
+	parser.add_argument('-a', "--all", dest="all",  action="store_true", default=False, help='Synchronize all the images.')
+	parser.add_argument('-r', "--report", dest="report",  action="store_true", default=False, help='Show the status of all the images.')
+	parser.add_argument('-u', "--update", dest="update",  action="store_true", default=False, help='Synchronize the images that need update.')
+	parser.add_argument('-n', "--new", dest="new",  action="store_true", default=False, help='Synchronize the images that are new.')
+	parser.add_argument('-p', "--push", dest="push", action="store_true", default=False, help='Push images instead of pulling.')
+
+	def folder(path):
+		if os.path.isdir(path):	return os.path.abspath(path)
+		else: raise argparse.ArgumentTypeError("The specified path is not a directory")
+
+	parser.add_argument('-f', "--tmpfolder", dest="folder", type=folder, default="/tmp", help='The path to temporarily put the image dumps. Defaults to /tmp.')
+
+	return parser.parse_args()
+
+def execute(command, ssh=None, print_output = False):
+        #print command
+	if type(command) is str: 
+          parts = [s.strip() for s in command.split(" ")]
+        #  parts =  unicode(parts)
+	else: parts = command
+        #print "----ssh----"
+        #print ssh
+        #[x.encode('UTF8') for x in ssh]
+        #ssh = [x.encode('unicode') for x in ssh]
+        #print "----part----"
+        #print parts
+	if ssh is not None:
+		parts = ssh  + parts
+                
+        #print parts
+        #print "-----"
+	p = subprocess.Popen(parts, stdout=subprocess.PIPE)
+	output = []
+
+	while True:
+		if print_output:
+			line = p.stdout.read(1024).decode("UTF-8")
+			sys.stdout.write(line)
+			sys.stdout.flush()
+		else:
+			line = p.stdout.readline().decode("UTF-8")
+
+		if len(line)==0: break
+		output.append(line)
+
+	return output, p.wait()
+
+def get_image_parents(image, ssh):
+	command = """
+	parent=$(docker inspect %s | grep -Po \"(?<=\\\"Id\\\": \\\")[^\\\"]*\"  );
+	while test $(echo $parent|wc -m) -eq 72;
+	do
+		echo $parent;
+		parent=$(docker inspect ${parent} | grep -Po \"(?<=\\\"Parent\\\": \\\")[^\\\"]*\" );
+	done;
+	"""%image
+	output, exit_val = execute(["bash", "-cl", command], ssh=ssh)
+	return [ID.strip() for ID in output] if exit_val==0 else None
+
+def get_all_images(ssh):
+	output, exit_val = execute("docker images -qa --no-trunc", ssh=ssh)
+	return [ID.strip() for ID in output] if exit_val==0 else None
+
+def get_common_parent(source_parents, dest_images):
+	for ID in source_parents:
+		if ID in dest_images: return ID
+
+if __name__ == '__main__':
+	main()
