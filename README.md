@@ -6,7 +6,7 @@
 
 https://github.com/dvddarias/docker-sync.git
 
-## Desciption :
+## Typical use case :
 
 Sync two docker registry 
 
